@@ -7,6 +7,7 @@
 //!
 //! The module uses only rune's and rune-kit's public API.
 
+pub mod docked_pane;
 mod pane;
 mod reorder;
 mod sidebar;

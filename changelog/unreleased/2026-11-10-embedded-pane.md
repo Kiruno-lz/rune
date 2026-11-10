@@ -1,0 +1,1 @@
+- Add a collapsible, resizable pane and divider for custom window layouts that do not use SplitView.
