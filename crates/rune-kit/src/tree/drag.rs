@@ -1,6 +1,50 @@
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use rune::{Color, Cursor, El, Phase, Tx, el};
+use rune::{Color, Cursor, El, Phase, ScrollPos, Tx, el};
+
+use super::TreeRow;
+
+#[derive(Default)]
+pub(super) struct DragViewport(Mutex<ViewportGeometry>);
+
+#[derive(Default)]
+struct ViewportGeometry {
+    rect: [f32; 4],
+    scroll: ScrollPos,
+}
+
+impl DragViewport {
+    pub(super) fn set_rect(&self, rect: [f32; 4]) {
+        self.0.lock().expect("tree viewport geometry lock").rect = rect;
+    }
+
+    pub(super) fn set_scroll(&self, scroll: ScrollPos) {
+        self.0.lock().expect("tree viewport geometry lock").scroll = scroll;
+    }
+
+    fn next_offset(&self, x: f32, y: f32) -> Option<f32> {
+        let geometry = self.0.lock().expect("tree viewport geometry lock");
+        let [left, top, width, height] = geometry.rect;
+        if !(left..left + width).contains(&x) || !(top..top + height).contains(&y) {
+            return None;
+        }
+        let edge = 26.0_f32.min(height / 4.0);
+        let local_y = y - top;
+        let pressure = if local_y < edge {
+            -(edge - local_y) / edge
+        } else if local_y > height - edge {
+            (local_y - height + edge) / edge
+        } else {
+            return None;
+        };
+        let scroll = geometry.scroll;
+        let offset = scroll.offset[1];
+        let next = (offset + 22.0 * pressure).clamp(0.0, scroll.max[1]);
+        (next != offset).then_some(next)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropPlacement {
@@ -56,10 +100,18 @@ impl<S: 'static> TreeDrag<S> {
         self
     }
 
-    pub(super) fn row(&self, s: &S, row: El, id: &str, tree_key: &str, height: f32, accent: Color) -> El {
+    pub(super) fn row(
+        &self,
+        s: &S,
+        row: El,
+        r: &TreeRow,
+        (tree_key, viewport): (&str, &Arc<DragViewport>),
+        height: f32,
+        accent: Color,
+    ) -> El {
         let active = (self.target)(s).as_ref();
         let edge = height * 0.25;
-        let id = id.to_owned();
+        let id = r.id.to_owned();
         let region = |zone, placement, top, height| {
             let region =
                 el().key(format!("{zone}:{id}")).pin(Some(0.0), Some(top), Some(0.0), None).h(height).a11y_hidden();
@@ -79,12 +131,17 @@ impl<S: 'static> TreeDrag<S> {
             .child(region("drop-inside", DropPlacement::Inside, edge, height - 2.0 * edge))
             .child(region("drop-after", DropPlacement::After, height - edge, edge));
         let tree_key = tree_key.to_owned();
+        let viewport_key = format!("{tree_key}/viewport");
+        let viewport = Arc::clone(viewport);
         let track = self.target_mut;
         let accept = self.accept.clone();
         let drop = self.drop.clone();
-        row.drag_threshold(4.0).on_drag(move |s: &mut S, drag, tx| {
+        row.on_drag(move |s: &mut S, drag, tx| {
             let release = match drag.phase {
-                Phase::Down => return,
+                Phase::Down => {
+                    tx.live_only();
+                    return;
+                }
                 Phase::Up if drag.cancelled() => {
                     *track(s) = None;
                     return;
@@ -92,7 +149,19 @@ impl<S: 'static> TreeDrag<S> {
                 Phase::Move => false,
                 Phase::Up => true,
             };
+            // Rune keeps the drag's scratch across events, even when the row unmounts.
+            if drag.data == 0.0 {
+                if drag.dx.abs().max(drag.dy.abs()) <= 4.0 {
+                    tx.live_only();
+                    return;
+                }
+                drag.data = 1.0;
+            }
             let [x, y] = drag.window_point();
+            if !release && let Some(next) = viewport.next_offset(x, y) {
+                tx.scroll_to_y(&viewport_key, next);
+                tx.drag_repeat_after(Duration::from_millis(16));
+            }
             let source = id.clone();
             let accept = accept.clone();
             let drop = drop.clone();
