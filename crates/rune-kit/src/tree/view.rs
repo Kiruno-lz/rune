@@ -6,7 +6,7 @@ use rune::{Color, El, GrowthSpec, Icon, KeyEvent, ScrollSpec, Span, TextStyle, T
 
 use crate::Kit;
 
-use super::{FileNode, TreeKey, TreeModel, TreeRow};
+use super::{FileNode, TreeDrag, TreeKey, TreeModel, TreeRow};
 
 /// What a standard tree row shows after its indent and chevron: an icon, a label and trailing
 /// content (change counts, a status dot, a badge, or any element).
@@ -318,6 +318,7 @@ pub struct Tree<S, T> {
     row: Option<RowFn<T>>,
     on_select: Option<IdFn<S>>,
     on_open: Option<IdFn<S>>,
+    drag: Option<TreeDrag<S>>,
     style: Option<TreeStyle>,
     name: Option<String>,
 }
@@ -326,7 +327,7 @@ impl<S: 'static, T: 'static> Tree<S, T> {
     /// `get` and `get_mut` find the model in the state; `label` names a node (rows show it, and
     /// typing jumps by it).
     pub fn new(get: fn(&S) -> &TreeModel<T>, get_mut: fn(&mut S) -> &mut TreeModel<T>, label: fn(&T) -> &str) -> Self {
-        Tree { get, get_mut, label, row: None, on_select: None, on_open: None, style: None, name: None }
+        Tree { get, get_mut, label, row: None, on_select: None, on_open: None, drag: None, style: None, name: None }
     }
     /// What each row shows; by default its label alone.
     pub fn row(mut self, f: impl for<'a> Fn(&T, &TreeRow<'a>) -> TreeItem + 'static) -> Self {
@@ -343,6 +344,11 @@ impl<S: 'static, T: 'static> Tree<S, T> {
         self.on_open = Some(Rc::new(f));
         self
     }
+    /// Enables in-tree drag and drop without changing selection or open handlers.
+    pub fn drag(mut self, drag: TreeDrag<S>) -> Self {
+        self.drag = Some(drag);
+        self
+    }
     pub fn style(mut self, s: TreeStyle) -> Self {
         self.style = Some(s);
         self
@@ -355,13 +361,14 @@ impl<S: 'static, T: 'static> Tree<S, T> {
 
     /// The tree, filling the height its parent gives it (set one with `.h(..)` or `.grow(..)`).
     pub fn build(self, s: &S, k: &Kit) -> El {
-        let Tree { get, get_mut, label, row, on_select, on_open, style, name } = self;
+        let Tree { get, get_mut, label, row, on_select, on_open, drag, style, name } = self;
         let style = style.unwrap_or_else(|| TreeStyle::from_kit(k));
         let model = get(s);
         let count = model.visible_len();
         let tree_key = model.key.clone();
         let kit = Rc::new(k.clone());
         let row_fn = row;
+        let drag_scope = tree_key.clone();
         let (sel, open) = (on_select.clone(), on_open.clone());
         let build_row = move |s: &S, i: usize| -> El {
             let m = get(s);
@@ -389,6 +396,9 @@ impl<S: 'static, T: 'static> Tree<S, T> {
             });
             if !openable && let Some(f) = open.clone() {
                 e = e.on_double_press_tx(move |s: &mut S, tx: &mut Tx| f(s, &id, tx));
+            }
+            if let Some(drag) = &drag {
+                e = drag.row(s, e, r.id, &drag_scope, style.row_height, kit.c.border_focus);
             }
             e
         };
