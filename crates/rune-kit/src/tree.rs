@@ -28,12 +28,16 @@ use std::collections::HashMap;
 
 use rune::{Key, KeyEvent, Tx};
 
+mod drag;
 mod file_tree;
 mod view;
 
 #[cfg(test)]
 mod tests;
 
+pub use drag::DropPlacement;
+pub use drag::DropTarget;
+pub use drag::TreeDrag;
 pub use file_tree::{FileNode, FileTree, file_icon, natural_cmp};
 pub use view::{Tree, TreeItem, TreeStyle};
 
