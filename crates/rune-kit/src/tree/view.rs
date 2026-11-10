@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::f32::consts::FRAC_PI_2;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rune::{Color, El, GrowthSpec, Icon, KeyEvent, ScrollSpec, Span, TextStyle, Tx, col, el, icon, rich, row, text};
 
@@ -369,6 +370,8 @@ impl<S: 'static, T: 'static> Tree<S, T> {
         let kit = Rc::new(k.clone());
         let row_fn = row;
         let drag_scope = tree_key.clone();
+        let drag_viewport = drag.as_ref().map(|_| Arc::clone(model.drag_viewport.get_or_init(Default::default)));
+        let row_viewport = drag_viewport.clone();
         let (sel, open) = (on_select.clone(), on_open.clone());
         let build_row = move |s: &S, i: usize| -> El {
             let m = get(s);
@@ -397,8 +400,8 @@ impl<S: 'static, T: 'static> Tree<S, T> {
             if !openable && let Some(f) = open.clone() {
                 e = e.on_double_press_tx(move |s: &mut S, tx: &mut Tx| f(s, &id, tx));
             }
-            if let Some(drag) = &drag {
-                e = drag.row(s, e, r.id, &drag_scope, style.row_height, kit.c.border_focus);
+            if let (Some(drag), Some(viewport)) = (&drag, &row_viewport) {
+                e = drag.row(s, e, &r, (&drag_scope, viewport), style.row_height, kit.c.border_focus);
             }
             e
         };
@@ -428,6 +431,17 @@ impl<S: 'static, T: 'static> Tree<S, T> {
                 m.row_height = style.row_height;
             })
             .child(rows);
+        let viewport = if let Some(metrics) = drag_viewport {
+            let geometry = metrics.clone();
+            viewport
+                .on_scroll_offset(move |scroll| metrics.set_scroll(scroll))
+                .on_drawn_layout_tx(move |_: &mut S, rect, tx| {
+                    geometry.set_rect(rect);
+                    tx.live_only();
+                })
+        } else {
+            viewport
+        };
         let mut root = col()
             .key(tree_key)
             .role("tree")

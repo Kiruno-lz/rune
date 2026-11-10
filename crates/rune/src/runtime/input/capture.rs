@@ -6,7 +6,7 @@
 //! double press is kept. The input routes in `pointer.rs`, `gesture.rs`, `secondary.rs` and
 //! `selection/click.rs` drive it.
 use crate::PointerButton;
-use crate::el::Drag;
+use crate::el::{Drag, DragFn};
 
 /// Where a held press stands against its element: a browser's `:active` while it's inside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +27,20 @@ pub(crate) struct FirstClick {
     pub(crate) point: (f32, f32),
 }
 
+/// The drag handler remains available while its row is virtualized out.
+#[derive(Clone)]
+pub(super) struct VirtualDrag {
+    pub(super) list: String,
+    pub(super) row: String,
+    pub(super) handler: DragFn,
+}
+
+impl std::fmt::Debug for VirtualDrag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualDrag").field("list", &self.list).field("row", &self.row).finish()
+    }
+}
+
 /// A press the pointer holds on element `path`.
 #[derive(Clone, Debug)]
 pub(crate) struct Held {
@@ -44,6 +58,7 @@ pub(crate) struct Held {
     pub(crate) second: bool,
     /// It's on a `drag_out` element and hasn't crossed this threshold (points) yet.
     pub(crate) drag_out: Option<f32>,
+    pub(super) virtual_drag: Option<VirtualDrag>,
     /// The pointer left the window while it held; the leave lands on release.
     pub(crate) left: bool,
 }
@@ -51,7 +66,7 @@ pub(crate) struct Held {
 impl Held {
     /// A press that just went down at `at`, inside its element and still.
     pub(crate) fn new(path: String, drag: Drag, button: PointerButton, at: (f32, f32), down_at: f64, second: bool, drag_out: Option<f32>) -> Self {
-        Self { path, drag, button, at, down_at, hit: Hit::Inside, moved: false, second, drag_out, left: false }
+        Self { path, drag, button, at, down_at, hit: Hit::Inside, moved: false, second, drag_out, virtual_drag: None, left: false }
     }
 
     pub(crate) fn inside(&self) -> bool { self.hit == Hit::Inside }

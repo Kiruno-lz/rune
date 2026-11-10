@@ -25,6 +25,7 @@
 use std::cell::{Ref, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use rune::{Key, KeyEvent, Tx};
 
@@ -102,6 +103,7 @@ pub struct TreeModel<T> {
     /// The viewport's height in points, for Page Up and Page Down.
     viewport: f32,
     row_height: f32,
+    drag_viewport: OnceLock<Arc<drag::DragViewport>>,
 }
 
 impl<T> Default for TreeModel<T> {
@@ -129,6 +131,7 @@ impl<T> TreeModel<T> {
             key: "tree".into(),
             viewport: 0.0,
             row_height: 24.0,
+            drag_viewport: OnceLock::new(),
         }
     }
 

@@ -108,6 +108,7 @@ impl<S: 'static> Runtime<S> {
             measured = self.settle_layout_reads(measured, tx);
         }
         self.apply(measured, tx);
+        self.cancel_missing_virtual_drag();
         self.scene.keep_flights(false);
         self.memo.keep_since(self.memo_since);
         self.track_focused_rows();

@@ -30,9 +30,9 @@ pub(super) enum Action {
     /// `El::on_link_secondary`: the text, its link and the press.
     LinkSecondary(String, usize, PointerEvent),
     SecondaryPress(String, PointerEvent),
-    Drag(String, Drag, crate::PointerButton),
+    Drag(String, Drag, crate::PointerButton, Option<crate::el::DragFn>),
     /// A held press's drag hearing the pointer again (`Tx::drag_repeat_after`).
-    DragRepeat(String, Drag, crate::PointerButton),
+    DragRepeat(String, Drag, crate::PointerButton, Option<crate::el::DragFn>),
     DragStart(String),
     DragEnd(String, crate::DragOutcome),
     /// A file drag from another app moved, left, or dropped (`drop_dispatch`).
@@ -419,8 +419,8 @@ impl<S: 'static> Runtime<S> {
                 f(states!(self), point, &mut one);
                 true
             }
-            Action::Drag(path, mut d, button) | Action::DragRepeat(path, mut d, button) => {
-                let Some(f) = self.node(&path).and_then(|n| n.handlers.on_drag.clone()) else { return false };
+            Action::Drag(path, mut d, button, captured) | Action::DragRepeat(path, mut d, button, captured) => {
+                let Some(f) = captured.or_else(|| self.node(&path).and_then(|n| n.handlers.on_drag.clone())) else { return false };
                 if d.phase == Phase::Move {
                     one.instant = true;
                 }

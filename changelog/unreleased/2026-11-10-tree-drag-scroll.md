@@ -1,0 +1,1 @@
+- Keep virtual-row drags captured when the source scrolls out of view. Tree drops scroll at the top and bottom edges and stop when released or cancelled.

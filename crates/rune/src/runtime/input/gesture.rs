@@ -191,10 +191,12 @@ impl<S: 'static> Runtime<S> {
         let [lx, ly] = self.to_local(i, x, y);
         let d = Drag { phase: Phase::Down, x: lx, y: ly, w: r[2] - r[0], h: r[3] - r[1], start_x: lx, start_y: ly, dx: 0.0, dy: 0.0, data: 0.0, clicks: 1, cancelled: false, window: [x, y], screen: self.screen_at(x, y) };
         let path = n.path.clone();
-        if n.handlers.on_drag.is_some() { self.queue.push(Action::Drag(path.clone(), d, button)); }
+        if n.handlers.on_drag.is_some() { self.queue.push(Action::Drag(path.clone(), d, button, None)); }
         self.press_clicks.clear();
         let now = self.now_clock();
-        self.press.hold(capture::Held::new(path, d, button, (x, y), now, false, None));
+        let mut held = capture::Held::new(path, d, button, (x, y), now, false, None);
+        held.virtual_drag = self.virtual_drag_at(i);
+        self.press.hold(held);
     }
 
     /// A mouse button came up at (x, y): the release of [`Self::button_down`].

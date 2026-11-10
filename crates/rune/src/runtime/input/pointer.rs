@@ -38,7 +38,10 @@ impl<S: 'static> Runtime<S> {
             self.input_drag(x, y, drag_move);
             return;
         }
-        let Some(i) = self.live_index(&path) else { return };
+        let Some(i) = self.live_index(&path) else {
+            if drag_move { self.move_virtual_drag(x, y, false); }
+            return;
+        };
         let (id, r, has_drag) = (self.nodes[i].id, self.nodes[i].target, self.nodes[i].handlers.on_drag.is_some() && !self.drags_out(&self.nodes[i]));
         // A hit rect is where the element was drawn (after scrolling); `target` is its
         // unscrolled layout rect, kept only for elements that were never drawn. Only the
@@ -57,7 +60,7 @@ impl<S: 'static> Runtime<S> {
             let (dx, dy) = (x - at.0, y - at.1);
             let [lx, ly] = self.to_local(i, x, y);
             let d = Drag { phase: Phase::Move, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..d };
-            self.queue.push(Action::Drag(path, d, button));
+            self.queue.push(Action::Drag(path, d, button, None));
         }
     }
 
@@ -119,16 +122,19 @@ impl<S: 'static> Runtime<S> {
     pub(super) fn cancel_drag(&mut self) -> bool {
         if self.input_click.captured { return false; }
         let Some(held) = self.press.held() else { return false };
-        let Some(i) = self.live_index(&held.path) else { return false };
-        if self.nodes[i].handlers.on_drag.is_none() || self.drags_out(&self.nodes[i]) { return false; }
-        let at = held.at;
-        let (x, y) = self.pointer.unwrap_or(at);
-        let [lx, ly] = self.to_local(i, x, y);
-        let (dx, dy) = (x - at.0, y - at.1);
-        let screen = self.screen_at(x, y);
+        let i = self.live_index(&held.path);
+        let captured = match i {
+            Some(i) if self.nodes[i].handlers.on_drag.is_some() && !self.drags_out(&self.nodes[i]) => None,
+            _ => {
+                let Some(drag) = &held.virtual_drag else { return false };
+                Some(drag.handler.clone())
+            }
+        };
+        let (x, y) = self.pointer.unwrap_or(held.at);
+        let mut d = self.drag_at(held, i, x, y, Phase::Up);
+        d.cancelled = true;
         let Some(held) = self.press.drop_held() else { return false };
-        let d = Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, cancelled: true, window: [x, y], screen, ..held.drag };
-        self.queue.push(Action::Drag(held.path, d, held.button));
+        self.queue.push(Action::Drag(held.path, d, held.button, captured));
         self.end_press_repeat();
         self.text_sel.dragging = false;
         true
@@ -279,9 +285,13 @@ impl<S: 'static> Runtime<S> {
         let path = n.path.clone();
         let drag_out = self.drags_out(n).then(|| n.handlers.drag_threshold.unwrap_or(crate::drag_out::DRAG_THRESHOLD));
         if n.handlers.on_drag.is_some() && drag_out.is_none() {
-            self.queue.push(Action::Drag(path.clone(), d, crate::PointerButton::Primary));
+            self.queue.push(Action::Drag(path.clone(), d, crate::PointerButton::Primary, None));
         }
-        self.press.hold(capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), now, second, drag_out));
+        let mut held = capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), now, second, drag_out);
+        if drag_out.is_none() {
+            held.virtual_drag = self.virtual_drag_at(ti);
+        }
+        self.press.hold(held);
     }
 
     pub fn pointer_up(&mut self, x: f32, y: f32) {
@@ -319,17 +329,23 @@ impl<S: 'static> Runtime<S> {
             .then(|| capture::FirstClick { path: h.path.clone(), at: h.down_at, point: h.at });
         let Some(held) = self.press.release(first) else { return };
         let inside = held.inside();
-        let capture::Held { path, drag: d, button, at, down_at, moved, second: double, .. } = *held;
         self.refresh_hover_within();
-        if moved { self.press_clicks.clear(); }
+        if held.moved { self.press_clicks.clear(); }
         if input_capture { return; }
-        let Some(i) = self.live_index(&path) else { return };
+        let i = self.live_index(&held.path);
+        let mut drag = self.drag_at(&held, i, x, y, Phase::Up);
+        let Some(i) = i else {
+            if let Some(captured) = &held.virtual_drag {
+                drag.cancelled = !self.virtual_drag_live(captured);
+                self.queue.push(Action::Drag(held.path, drag, held.button, Some(captured.handler.clone())));
+            }
+            return;
+        };
+        let capture::Held { path, button, down_at, moved, second: double, .. } = *held;
         let n = &self.nodes[i];
         let (has_drag, has_press, has_double) = (n.handlers.on_drag.is_some() && !self.drags_out(n), n.handlers.on_press.is_some(), n.handlers.on_double_press.is_some());
         if has_drag {
-            let (dx, dy) = (x - at.0, y - at.1);
-            let [lx, ly] = self.to_local(i, x, y);
-            self.queue.push(Action::Drag(path.clone(), Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..d }, button));
+            self.queue.push(Action::Drag(path.clone(), drag, button, None));
         }
         self.link_up(&path, x, y, inside);
         if has_press && inside && !selected {
@@ -339,6 +355,62 @@ impl<S: 'static> Runtime<S> {
         if has_double && inside && click && button == crate::PointerButton::Primary && double {
             self.queue.push(Action::DoublePress(path));
         }
+    }
+
+    pub(super) fn virtual_drag_at(&self, i: usize) -> Option<capture::VirtualDrag> {
+        let handler = self.nodes[i].handlers.on_drag.clone()?;
+        let mut child = i;
+        while let Some(parent) = self.nodes[child].parent {
+            let list = &self.nodes[parent].path;
+            if let Some(virtual_list) = self.virtuals.get(list) {
+                let row = self.nodes[child].key.as_ref()?;
+                return virtual_list.has(row).then(|| capture::VirtualDrag {
+                    list: list.clone(),
+                    row: row.clone(),
+                    handler,
+                });
+            }
+            child = parent;
+        }
+        None
+    }
+
+    fn virtual_drag_live(&self, drag: &capture::VirtualDrag) -> bool {
+        self.live_index(&drag.list).is_some()
+            && self.virtuals.get(&drag.list).is_some_and(|list| list.has(&drag.row))
+    }
+
+    pub(super) fn cancel_missing_virtual_drag(&mut self) {
+        if self.press.held().and_then(|held| held.virtual_drag.as_ref()).is_some_and(|drag| !self.virtual_drag_live(drag)) {
+            self.cancel_drag();
+        }
+    }
+
+    pub(super) fn move_virtual_drag(&mut self, x: f32, y: f32, repeat: bool) {
+        let Some(held) = self.press.held() else { return };
+        let Some(captured) = &held.virtual_drag else { return };
+        if !self.virtual_drag_live(captured) {
+            self.cancel_drag();
+            return;
+        }
+        let drag = self.drag_at(held, None, x, y, Phase::Move);
+        let path = held.path.clone();
+        let handler = Some(captured.handler.clone());
+        let button = held.button;
+        self.queue.push(if repeat {
+            Action::DragRepeat(path, drag, button, handler)
+        } else {
+            Action::Drag(path, drag, button, handler)
+        });
+    }
+
+    pub(super) fn drag_at(&self, held: &capture::Held, i: Option<usize>, x: f32, y: f32, phase: Phase) -> Drag {
+        let (dx, dy) = (x - held.at.0, y - held.at.1);
+        let [lx, ly] = i.map_or_else(
+            || [held.drag.start_x + dx, held.drag.start_y + dy],
+            |i| self.to_local(i, x, y),
+        );
+        Drag { phase, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..held.drag }
     }
 
     pub fn pointer_leave(&mut self) {

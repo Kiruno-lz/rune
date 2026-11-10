@@ -28,11 +28,12 @@ impl<S: 'static> Runtime<S> {
         if self.press_repeat.due.is_none() || self.press_repeat_waiting() { return; }
         let Some((path, _)) = self.press_repeat.due.take() else { return };
         let Some(held) = self.press.held().filter(|h| h.path == path) else { return };
-        let (d, at, button) = (held.drag, held.at, held.button);
-        let Some(i) = self.live_index(&path) else { return };
-        let (x, y) = self.pointer.unwrap_or(at);
-        let [lx, ly] = self.to_local(i, x, y);
-        let (dx, dy) = (x - at.0, y - at.1);
-        self.queue.push(Action::DragRepeat(path, Drag { phase: Phase::Move, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..d }, button));
+        let (x, y) = self.pointer.unwrap_or(held.at);
+        if let Some(i) = self.live_index(&path) {
+            let drag = self.drag_at(held, Some(i), x, y, Phase::Move);
+            self.queue.push(Action::DragRepeat(path, drag, held.button, None));
+        } else {
+            self.move_virtual_drag(x, y, true);
+        }
     }
 }
