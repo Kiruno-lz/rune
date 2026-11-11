@@ -53,6 +53,7 @@ mod glyph_cache;
 mod glyph_emit;
 mod hash;
 mod hidden_axes;
+mod inline_fit;
 pub(crate) mod icon;
 mod layout_cache;
 mod macos;
@@ -65,7 +66,11 @@ mod pill_chips;
 mod rich_layout;
 mod run;
 pub(crate) use pill_chips::{bare_icons, pill_chips};
+mod support;
+pub use support::SmoothingSupport;
+pub(crate) use support::note_dual_source;
 mod svg_path;
+mod synthetic_bold;
 mod trak;
 mod underline;
 mod line_metrics;
@@ -193,7 +198,11 @@ pub struct TextSystem {
     cluster_scratch: Vec<(f32, u32)>,
     coords_scratch: Vec<i16>,
     traks: Traks,
+    /// The mode glyphs draw in: [`Self::requested`]'s, or its grayscale twin while subpixel
+    /// text can't draw ([`FontSmoothing::drawn`]).
     pub(crate) smoothing: FontSmoothing,
+    /// The mode the app asked for ([`Self::set_font_smoothing`]).
+    requested: FontSmoothing,
     /// The `trak` table of the first font of a family slot at a weight, upright or italic.
     primary_traks: FxHashMap<(Family, u32, bool), Option<Rc<Trak>>>,
     /// The hidden-axis coordinates (`hidden_axes`) of the same first font.
@@ -333,6 +342,7 @@ impl TextSystem {
             coords_scratch: Vec::new(),
             traks: Traks::new(),
             smoothing: FontSmoothing::default(),
+            requested: FontSmoothing::default(),
             primary_traks: Default::default(),
             primary_axes: Default::default(),
             apple: Default::default(),
@@ -375,6 +385,14 @@ impl TextSystem {
             .into();
         self.primary_axes.insert(key, axes.clone());
         axes
+    }
+
+    /// The ascent and descent per em of the font text in `family` at `weight` shapes with first.
+    fn primary_extents(&mut self, family: Family, weight: f32, italic: bool) -> Option<(f32, f32)> {
+        let font = self.primary_font(family, weight, italic)?;
+        let m = FontRef::from_index(font.blob.as_ref(), font.index as usize)?.metrics(&[]);
+        let em = f32::from(m.units_per_em.max(1));
+        Some((m.ascent / em, m.descent / em))
     }
 
     /// The font text in `family` at `weight` shapes with first.
@@ -432,11 +450,11 @@ impl TextSystem {
 
     /// Whether glyphs rasterise with DirectWrite: `FontSmoothing::DirectWrite` where it exists.
     pub(crate) fn direct_write(&mut self) -> bool {
-        self.smoothing == FontSmoothing::DirectWrite && self.windows.available()
+        matches!(self.smoothing, FontSmoothing::DirectWrite | FontSmoothing::ClearType) && self.windows.available()
     }
 
     /// How glyphs rasterise and place ([`FontSmoothing`]).
-    pub fn font_smoothing(&self) -> FontSmoothing { self.smoothing }
+    pub fn font_smoothing(&self) -> FontSmoothing { self.requested }
 
     /// How far each gliding glyph mask's ink sits below the top of its quad, in device px, keyed
     /// as `blend::apron_key` keys its instance: a DirectWrite or Windfoil mask keeps one box across its y
@@ -445,7 +463,7 @@ impl TextSystem {
     /// moves its coverage by this so a glide reads as the quarter-pixel steps it draws.
     pub(crate) fn glyph_shifts(&self) -> std::collections::HashMap<[u32; 3], f32> {
         self.atlas.map.iter()
-            .filter(|(k, _)| k.subpy != 0 && matches!(k.apple, glyph_emit::DIRECT_WRITE_KEY | glyph_emit::WINDFOIL_KEY))
+            .filter(|(k, _)| k.subpy != 0 && k.apple & (glyph_emit::DIRECT_WRITE_KEY | glyph_emit::WINDFOIL_KEY) != 0)
             .filter_map(|(k, a)| a.mask().map(|a| ([(a.x as f32).to_bits(), (a.y as f32).to_bits(), (a.page as f32).to_bits()], k.subpy as f32 / glyph_emit::GLIDE_PHASES as f32)))
             .collect()
     }
@@ -462,8 +480,17 @@ impl TextSystem {
     /// stages ([`FontSmoothing::pipeline`]). Glyphs already rasterised in another mode stay
     /// cached under their own keys.
     pub fn set_font_smoothing(&mut self, mode: FontSmoothing) {
-        self.smoothing = mode;
-        self.apple.set_pipeline(mode.pipeline());
+        self.requested = mode;
+        self.smoothing = mode.drawn(self.lcd_ok());
+        self.apple.set_pipeline(self.smoothing.pipeline());
+        self.atlas.lcd = self.smoothing.lcd();
+    }
+
+    /// Whether subpixel text draws here now: the renderer draws outlines and blends by channel,
+    /// and for ClearType, DirectWrite is there.
+    fn lcd_ok(&mut self) -> bool {
+        support::lcd_ok(self.atlas.outlines.support())
+            && (self.requested != FontSmoothing::ClearType || self.windows.available())
     }
 
     /// The CoreGraphics stages glyphs rasterize with.
@@ -480,6 +507,11 @@ impl TextSystem {
     }
 
     pub(crate) fn begin_frame_pinned(&mut self, pinned_mask: u32) {
+        // A subpixel mode draws grayscale until the renderer can blend by channel, and after it
+        // says it can't.
+        if self.requested.lcd() && self.requested.drawn(self.lcd_ok()) != self.smoothing {
+            self.set_font_smoothing(self.requested);
+        }
         self.atlas.begin_frame(pinned_mask);
         self.paths.begin_frame();
         self.glyph_cache.begin_frame();
@@ -650,6 +682,8 @@ impl TextSystem {
             .collect();
         // Each style range's predicted first font at its weight, drawn at its named instance.
         let base_axes = self.primary_axes(style.family, style.weight, style.italic);
+        // The strut inline code keeps inside (`inline_fit`).
+        let strut = if mono_style || !spans.iter().any(|s| s.mono) { None } else { self.primary_extents(style.family, style.weight, style.italic) };
         let span_axes: Vec<Rc<[parley::FontVariation]>> = spans
             .iter()
             .map(|s| {
@@ -716,7 +750,7 @@ impl TextSystem {
         let off = [b"liga", b"clig", b"calt", b"dlig"].map(|tag| parley::FontFeature::new(parley::setting::Tag::new(tag), 0));
         let unligated: Vec<parley::FontFeature> = features.iter().chain(&off).copied().collect();
         type Spacings = [(std::ops::Range<usize>, f32)];
-        let build = |lcx: &mut LayoutContext<Ink>, fcx: &mut FontContext, exact: &Spacings, widen: &Spacings, weights: &Spacings| {
+        let build = |lcx: &mut LayoutContext<Ink>, fcx: &mut FontContext, exact: &Spacings, widen: &Spacings, weights: &Spacings, fits: &Spacings, bold: &[(std::ops::Range<usize>, u16)]| {
             let mut b = lcx.ranged_builder(fcx, text, scale, true);
             b.set_base_direction(base);
             // Lines break where Chromium breaks them: after every run of spaces, even before a
@@ -789,6 +823,12 @@ impl TextSystem {
             for (range, w) in weights {
                 b.push(StyleProperty::FontWeight(FontWeight::new(*w)), range.clone());
             }
+            for (range, lh) in fits {
+                b.push(LineHeight::Absolute(*lh), range.clone());
+            }
+            for (range, ink) in bold {
+                b.push(StyleProperty::Brush(Ink(*ink)), range.clone());
+            }
             for (range, stack) in &routed {
                 b.push(FontFamily::from(stacks[*stack].as_deref().unwrap_or_default()), range.clone());
             }
@@ -797,6 +837,14 @@ impl TextSystem {
             }
             for (range, v) in widen {
                 b.push(StyleProperty::WordSpacing(*v), range.clone());
+            }
+            // Blink widens each glyph in synthetic bold by a pixel (`SyntheticBoldOffset`).
+            for (range, _) in bold {
+                let at = range.start;
+                let v = exact.iter().find(|(r, _)| r.contains(&at)).map(|e| e.1)
+                    .or_else(|| spans.iter().zip(&span_spacing).rev().find_map(|(s, v)| v.filter(|_| span_range(s).contains(&at))))
+                    .unwrap_or(base_spacing);
+                b.push(StyleProperty::LetterSpacing(v + synthetic_bold::ADVANCE), range.clone());
             }
             // Boxes before and after a pill's label make room for its chip. The label may break
             // like any text; `break_lines_with_blocks` moves a split pill whole to the next line
@@ -818,16 +866,29 @@ impl TextSystem {
             break_lines(&mut layout);
             layout
         };
-        let mut layout = build(&mut self.layout_cx, &mut self.font_cx, &[], &widen, &[]);
+        let mut layout = build(&mut self.layout_cx, &mut self.font_cx, &[], &widen, &[], &[], &[]);
         // On Windows, system faces as DirectWrite picks them for each run's weight, as Chromium.
-        let weights = if cfg!(target_os = "windows") && !text.is_ascii() {
-            let wanted = |at: usize| spans.iter().rev().find_map(|s| s.weight.filter(|_| span_range(s).contains(&at))).unwrap_or(style.weight);
+        let system = cfg!(target_os = "windows") && !text.is_ascii();
+        let wanted = |at: usize| spans.iter().rev().find_map(|s| s.weight.filter(|_| span_range(s).contains(&at))).unwrap_or(style.weight);
+        let weights = if system {
             system_weight::corrections(&mut self.system_faces, &mut self.font_cx, &self.font_files, &layout, wanted)
         } else {
             Vec::new()
         };
         if !weights.is_empty() {
-            layout = build(&mut self.layout_cx, &mut self.font_cx, &[], &widen, &weights);
+            layout = build(&mut self.layout_cx, &mut self.font_cx, &[], &widen, &weights, &[], &[]);
+        }
+        // Inline code keeps inside the line box its text sets, as a browser's does.
+        let fits = strut.map_or_else(Vec::new, |strut| inline_fit::mono_fits(&layout, text, spans, style, scale, strut));
+        // Bold asked of a system face with no bold draws synthetic bold, as Chromium's does.
+        let bolds = cfg!(target_os = "windows") && (style.weight >= 600.0 || spans.iter().any(|s| s.weight.is_some_and(|w| w >= 600.0)));
+        let bold = if bolds {
+            synthetic_bold::inks(&system_weight::synthetic_bold(&mut self.system_faces, &mut self.font_cx, &self.font_files, &layout, wanted), spans)
+        } else {
+            Vec::new()
+        };
+        if !fits.is_empty() || !bold.is_empty() {
+            layout = build(&mut self.layout_cx, &mut self.font_cx, &[], &widen, &weights, &fits, &bold);
         }
         // The spacing each run got, against the spacing its own font needs.
         let given = |at: usize| {
@@ -852,7 +913,7 @@ impl TextSystem {
             }
         }
         if mismatch {
-            layout = build(&mut self.layout_cx, &mut self.font_cx, &exact, &widen, &weights);
+            layout = build(&mut self.layout_cx, &mut self.font_cx, &exact, &widen, &weights, &fits, &bold);
         }
         layout.align(align, AlignmentOptions::default());
         let l = Rc::new(layout);
@@ -956,6 +1017,7 @@ impl TextSystem {
             byte: 0,
             color: 0,
             outline: None,
+            lcd: false,
         })
     }
 }

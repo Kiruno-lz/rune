@@ -100,7 +100,7 @@ impl<S: 'static> Runtime<S> {
                 for substep in 0..if in_run { 0 } else { steps.min(240) } {
                     if !stack.pending_heights.is_empty() {
                         let at = now - f64::from(self.grow_acc) - f64::from((steps.min(240) - substep) as f32 * SUBSTEP);
-                        if at >= stack.width_hold_until && let Some(height) = stack.pending_heights.remove(id) {
+                        if !stack.width_hold.defers(at) && let Some(height) = stack.pending_heights.remove(id) {
                             g.retarget(height);
                         }
                     }
@@ -177,9 +177,9 @@ impl<S: 'static> Runtime<S> {
                 moving |= active;
                 continue;
             }
-            let held = (!self.keeps.is_empty() || !self.scroll_reveals.is_empty()) && {
+            let held = !self.requests.is_empty() && {
                 let path = &self.nodes[i].path;
-                (self.keeps.iter().any(|k| k.viewport == *path) || self.scroll_reveals.iter().any(|r| r.viewport == *path))
+                self.requests.owns(path)
                     && self.scroll_stack(i).and_then(|c| self.stacks.get(&self.nodes[c].id)).is_some_and(|s| s.growing)
             };
             let laid = if axes.y() { self.ease_to_shrunk_end(i, overflow) } else { None };

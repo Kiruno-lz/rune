@@ -242,7 +242,7 @@ fn same_el_cold(a: &crate::el::ElCold, b: &crate::el::ElCold) -> bool {
     let crate::el::ElCold {
         focus, looping, trace_name, trace_namespace, role, label, live, above, motion, opacity_motion, lead,
         transition, matched, scroll, scroll_axes, sticky, scroll_edges, growth, virtual_estimate, virtual_rows,
-        virtual_rows_version, glide, input, time_scale, help, help_cut, help_above, material, aspect_fit, a11y,
+        virtual_rows_version, glide, input, time_scale, help, help_cut, help_side, material, aspect_fit, a11y,
         #[cfg(debug_assertions)]
         scroll_source: _,
         #[cfg(debug_assertions)]
@@ -276,7 +276,7 @@ fn same_el_cold(a: &crate::el::ElCold, b: &crate::el::ElCold) -> bool {
         && a.time_scale == *time_scale
         && a.help == *help
         && a.help_cut == *help_cut
-        && a.help_above == *help_above
+        && a.help_side == *help_side
         && a.material == *material
         && a.aspect_fit == *aspect_fit
         && a.a11y == *a11y
@@ -391,7 +391,7 @@ fn same_handlers(
         && opt_rc_eq(&a.on_at_bottom, on_at_bottom)
         && match (&a.on_far_from_bottom, on_far_from_bottom) {
             (None, None) => true,
-            (Some((da, fa)), Some((db, fb))) => da == db && Rc::ptr_eq(fa, fb),
+            (Some((da, ua, fa)), Some((db, ub, fb))) => da == db && ua == ub && Rc::ptr_eq(fa, fb),
             _ => false,
         }
         && opt_rc_eq(&a.on_visible_rows, on_visible_rows)

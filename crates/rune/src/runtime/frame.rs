@@ -8,10 +8,12 @@ impl<S: 'static> Runtime<S> {
         self.wall_start.map_or(self.clock, |t| t.elapsed().as_secs_f64())
     }
 
+    /// The window's size in its points and its scale. The view lays out in them over its zoom
+    /// ([`Cx::zoom`]), at the scale times the zoom.
     pub fn set_viewport(&mut self, viewport: (f32, f32), scale: f32) {
-        // Someone resized a window that fits its content (not a page's band): back to its height.
-        if self.fit_height && !self.page.on && self.window_resting && (self.fit_asked.unwrap_or(self.viewport.1) - viewport.1).abs() > 0.5 {
-            self.fit_asked = None;
+        (self.zoom.window, self.zoom.window_scale) = (viewport, scale);
+        let (viewport, scale) = self.zoom.view();
+        if self.fit_resized(viewport.1) {
             self.relayout = true;
             self.viewport_stepped = false;
         }
@@ -22,6 +24,8 @@ impl<S: 'static> Runtime<S> {
     /// user's resize it doesn't land running motion: content at rest follows the window and
     /// springs keep going.
     pub(crate) fn step_viewport(&mut self, viewport: (f32, f32), scale: f32) {
+        (self.zoom.window, self.zoom.window_scale) = (viewport, scale);
+        let (viewport, scale) = self.zoom.view();
         let fresh = !self.relayout;
         if self.change_viewport(viewport, scale) && fresh { self.viewport_stepped = true; }
     }
@@ -56,8 +60,13 @@ impl<S: 'static> Runtime<S> {
         if self.window_focused != Some(focused) {
             // Refocused, the pointer where it was hovers again; blurred, it waits for a move.
             if focused && self.window_focused == Some(false) { self.hover_paused = false; }
-            // A focused field's selection takes its active or inactive pair (`El::selection_style`).
-            if self.window_focused.is_some() && self.focused_input().is_some_and(|i| i.selection_style.is_some()) { self.dirty = true; }
+            // A selection takes its active or inactive pair (`El::selection_style`): a focused
+            // field's, or a selectable text's.
+            if self.window_focused.is_some()
+                && (self.focused_input().is_some_and(|i| i.selection_style.is_some()) || self.text_selection().is_some_and(|(_, r)| !r.is_empty()))
+            {
+                self.dirty = true;
+            }
             self.window_focused = Some(focused);
             if let Some(f) = self.on_focus { self.update(|s, tx| f(s, focused, tx)); }
             // Deliver the cancelled Up before FocusLost can commit a view that removes its
@@ -73,11 +82,8 @@ impl<S: 'static> Runtime<S> {
                 self.keys_lost();
                 // Losing the window ends hover, rather than waiting out an exit grace. A window
                 // that isn't key still hears the pointer, so its next move starts the wait again.
-                self.hover_pending.clear();
+                self.end_hover_delays();
                 self.hover_paused = true;
-                for path in std::mem::take(&mut self.hover_shown) {
-                    self.queue.push(Action::HoverChange(path, false));
-                }
             }
         }
         if !focused { self.input_click.clear(); self.wheel_lost(); }
@@ -143,7 +149,7 @@ impl<S: 'static> Runtime<S> {
         // Its wakes count from now (`schedule_pending_wakes`), so its clock reads now too.
         let mut one = Tx { clock: self.now_clock(), ..self.transaction() };
         let changed = crate::tooling::perf_warn::timed("an `update` closure", || f(&mut self.state, &mut one));
-        let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.smoothing)
+        let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.font_smoothing())
             || self.changes_families(&one)
             || (one.blur && self.focus.path().is_some());
         self.latch_requests(&mut one);
@@ -257,7 +263,7 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn transaction(&self) -> Tx {
         Tx { trace: self.tracing().then(crate::el::TraceCalls::default), mods: self.held_mods, selection: self.selection_snapshot(),
-            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), ..Tx::default() }
+            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), focused: self.focused_key(), ..Tx::default() }
     }
 
     /// A scalar from the actual draw path (e.g. `shell.width`). Values hold until resampled.
@@ -611,7 +617,7 @@ impl<S: 'static> Runtime<S> {
         if !scroll_pages.is_empty() { self.scroll_pages(scroll_pages); }
         if !scroll_offsets.is_empty() { self.scroll_to_offsets(scroll_offsets); }
         // Explicit destinations processed after a reveal win for its entire lifetime.
-        if destination { self.scroll_reveals.clear(); }
+        if destination { self.requests.step(requests::Event::Destination); }
         // Those scrolls moved the caret after the commit a view placed from it saw.
         if self.caret_watch && self.caret_moved(None) { self.commit(&Tx { instant: true, ..Tx::default() }); }
         if let Some(request) = tx.select.take() {
@@ -631,8 +637,7 @@ impl<S: 'static> Runtime<S> {
             for event in trace.events { self.trace_event(event); }
             for (name, kind, value) in trace.channels { self.trace_channel(name, kind, value); }
         }
-        self.fit_held = std::mem::take(&mut self.fit_hold);
-        let dt = if self.fit_held { 0.0 } else { dt };
+        let dt = if self.fit_frame_holds() { 0.0 } else { dt };
         let instant_scroll = tx.instant || self.settled;
         let animating = self.step_motion(dt, instant_scroll) || live_animating;
         self.stats.shaped = self.text.shaped - shaped0;

@@ -133,7 +133,9 @@ pub fn extra_args() -> &'static [String] {
 }
 
 pub(crate) fn runtime_for<S: 'static>(spec: &AppSpec<S>, state: S, size: (f32, f32), env: Env, waker: Waker) -> Runtime<S> {
+    crate::marks::mark("text.begin");
     let text = TextSystem::for_window(spec.fonts, spec.families);
+    crate::marks::mark("text.fonts");
     let mut rt = Runtime::with_text(state, spec.view, size, env, text);
     rt.poll = spec.poll;
     rt.on_key = spec.on_key;
@@ -144,7 +146,9 @@ pub(crate) fn runtime_for<S: 'static>(spec: &AppSpec<S>, state: S, size: (f32, f
         rt.hot = Some(crate::hot::Session::connect(waker.clone()));
     }
     if let Some(f) = spec.setup {
+        crate::marks::mark("app.setup");
         f(&mut rt.state, waker);
+        crate::marks::mark("app.setup.done");
     }
     rt
 }
@@ -502,6 +506,7 @@ pub(crate) mod headless_run;
 pub(crate) mod interaction;
 pub(crate) mod perf_warn;
 pub(crate) mod record;
+pub(crate) mod virtual_desktop;
 #[cfg(test)]
 pub(crate) mod test_alloc;
 #[cfg(test)]

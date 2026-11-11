@@ -4,14 +4,17 @@ on:
   push:
     branches: [dev]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
 
-# A push or PR update makes its older runs moot; an hour-long Mac job per push queued six deep.
+# One run at a time per branch, and a newer push replaces any run still waiting (an hour-long Mac
+# job per push queued six deep). On dev a running job finishes, so a busy branch still gets results;
+# a PR update cancels its running job.
 concurrency:
   group: macos-tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   size:
@@ -20,7 +23,10 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/file-size.sh
 
+  # Mac runners are scarce and shared across the organisation, and this job takes over an hour, so
+  # draft PRs skip it; marking a PR ready for review starts it.
   test:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: macos-latest
     timeout-minutes: 90
     env:
@@ -36,5 +42,5 @@ jobs:
       # The virtual Metal adapter does not expose TIMESTAMP_QUERY. Keep the
       # shader freshness, pipeline, rendering, font and menu tests enabled.
       - run: >-
-          cargo test -p rune -p rune-kit --features rune-kit/markdown --no-fail-fast --
+          cargo test -p rune -p rune-kit --features rune-kit/markdown,rune-kit/mermaid --no-fail-fast --
           --skip gpu::metal::compute_tests::passes_sample_timestamps_at_their_boundaries

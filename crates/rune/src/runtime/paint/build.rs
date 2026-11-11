@@ -53,6 +53,7 @@ impl<S: 'static> Runtime<S> {
             self.sticky_frame.resize(n_nodes, sticky::UNBOUNDED);
         }
         let sel_ranges = self.selection_ranges();
+        let mark_ranges = self.mark_ranges();
         self.ime_area = None;
         let now = self.t;
         let vp = [0.0, 0.0, self.viewport.0 * s, self.viewport.1 * s];
@@ -85,7 +86,7 @@ impl<S: 'static> Runtime<S> {
             self.dissolve_scratch[parent] |= opacity > 0.001 && opacity < 1.0;
         }
 
-        let paint_state_hash = self.prepare_cache_layers(&sel_ranges);
+        let paint_state_hash = self.prepare_cache_layers(&sel_ranges, &mark_ranges);
 
         self.place_growth_rows();
 
@@ -314,11 +315,11 @@ impl<S: 'static> Runtime<S> {
             let tracked_scale = if has_live_scale { static_k * p.transform.scale.x } else { static_k };
             let scale_settling = if tracked_scale != 1.0 || has_live_scale || self.static_scales.contains_key(&n.id) {
                 let t = self.t;
-                let seen = self.static_scales.entry(n.id).or_insert((tracked_scale, f64::NEG_INFINITY, false));
+                let seen = self.static_scales.entry(n.id).or_insert((tracked_scale, f64::NEG_INFINITY));
                 if self.settled {
-                    *seen = (tracked_scale, f64::NEG_INFINITY, seen.2);
+                    *seen = (tracked_scale, f64::NEG_INFINITY);
                 } else if (seen.0 - tracked_scale).abs() > 1e-5 {
-                    *seen = (tracked_scale, t, true);
+                    *seen = (tracked_scale, t);
                 }
                 let moving = t - seen.1 < STATIC_SCALE_SETTLE;
                 if !has_live_scale {
@@ -710,7 +711,7 @@ impl<S: 'static> Runtime<S> {
             let glyphs_clear = rounded.is_some_and(|(mask, radii)| {
                 self.text_clip(i, (r, r_exact), sc, clip).is_some_and(|(text, ..)| inside_rounded(text, mask, radii))
             });
-            isolate |= open_cache || (rounded.is_some() && (n.text.as_ref().is_some_and(|t| (t.truncate_fade || t.live.is_some()) && !glyphs_clear)
+            isolate |= open_cache || (rounded.is_some() && (n.text.as_ref().is_some_and(|t| (t.truncate_fade || t.cold.live.is_some()) && !glyphs_clear)
                 || n.input.as_ref().is_some_and(|i| i.single_line)));
             // A soft clip fades each primitive on its own, so where one paints over another (an
             // image over its placeholder fill, a label over its bubble) the one beneath shows
@@ -1143,6 +1144,7 @@ impl<S: 'static> Runtime<S> {
                         caret: input_caret.map(|(caret, _)| caret),
                     },
                     &sel_ranges,
+                    &mark_ranges,
                     &mut glyph_count,
                 );
             }
@@ -1189,22 +1191,16 @@ impl<S: 'static> Runtime<S> {
                 let offset = self.stuck_offset(i, p.rect.edges()[3]).unwrap_or(st.offset);
                 let held = self.bottom_offset(i, p.rect.edges()[3]).is_some_and(|b| (offset - b).abs() < 0.5);
                 let exact = offset as f32 + st.slack.height();
-                // Hold a reversal across a rounding boundary, not a full pixel of real travel:
-                // `grid` rounds to 1/64 of a device pixel. Always land at the layout offset.
-                let rounded = grid(exact, s);
-                let step = (rounded - st.drawn[1]).signum() as i8;
-                let back = st.pinned() && rounded != grid(st.offset as f32, s) && step == -st.drawn_step && ((exact - st.drawn[1]) * s).abs() < 1.0 / 64.0;
-                let drawn = if back { st.drawn[1] } else { rounded };
-                let moved = if drawn == st.drawn[1] { st.drawn_step } else { step };
+                let (drawn, hold) = st.drawn.draw(exact, st.offset as f32, st.pinned(), s);
                 dy -= drawn;
                 snap_rigid[1] -= drawn;
-                if let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) { (st.held, st.drawn[1], st.drawn_step) = (held, drawn, moved); }
+                if let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) { (st.held, st.drawn) = (held, hold); }
             }
             let (mut scale, mut anchor, mut anchor_to, mut dx) = (sc, anchor, anchor_to, pinh.dx);
             if n.scroll_axes.x() && let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) {
-                st.drawn[0] = grid(st.x.shift() as f32, s);
-                dx -= st.drawn[0];
-                snap_rigid[0] -= st.drawn[0];
+                st.drawn_x = grid(st.x.shift() as f32, s);
+                dx -= st.drawn_x;
+                snap_rigid[0] -= st.drawn_x;
             }
             if open_cache && sc > 1e-4 {
                 dx += (r_exact[0] / s - rect_pt[0]) / sc;

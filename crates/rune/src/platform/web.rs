@@ -12,6 +12,7 @@ use super::web_math;
 const SKIRT: f32 = 256.0;
 #[cfg(feature = "embedded-fonts")]
 mod full_faces;
+pub(crate) mod health;
 mod input;
 mod page;
 pub(crate) mod platform;
@@ -53,7 +54,7 @@ pub(crate) fn run<S: 'static>(app: App<S>) -> Result<(), String> {
     if !app.overlays.is_empty() || !app.windows.is_empty() {
         return Err("web supports one canvas; overlays and multiple windows are unsupported".into());
     }
-    if !app.open || app.on_window.is_some() || app.on_ready.is_some() {
+    if !app.open || app.on_window.is_some() {
         return Err("web does not support windowless apps or native window hooks".into());
     }
     console_error_panic_hook::set_once();
@@ -75,7 +76,7 @@ fn spawn<S: 'static>(mut app: App<S>) -> Result<(), String> {
     shared.connect(Arc::new(move || { let _ = wake.send_event(Wake::App); }));
     page::occupy(quitting(&shared), app.same_tab_router.take());
     event_loop.spawn_app(Browser { app: Some(app), shared, proxy, window: None, embedded: false, document: false, owns_canvas: true,
-        borrowed: page::Borrowed::default(), pending: Rc::default(), running: Rc::default() });
+        borrowed: page::Borrowed::default(), pending: Rc::default(), running: Rc::default(), lost: Rc::default() });
     Ok(())
 }
 
@@ -94,6 +95,8 @@ struct Browser<S: 'static> {
     /// The GPU, and the bytes of `App::font_url`'s fonts that loaded.
     pending: Rc<RefCell<Option<(Result<(Gpu, wgpu::Surface<'static>), String>, Vec<Vec<u8>>)>>>,
     running: Rc<RefCell<Option<Running<S>>>>,
+    /// Why the browser lost the GPU device, until the app ends for it.
+    lost: Rc<RefCell<Option<String>>>,
 }
 
 struct Running<S: 'static> {
@@ -110,6 +113,8 @@ struct Running<S: 'static> {
     document: bool,
     /// The first frame is on screen.
     presented: bool,
+    /// `App::on_ready`, which runs once that first frame is presented, as a window's does.
+    on_ready: Option<crate::app::OnWindow>,
     /// Where the canvas was last put in the document (a page's band top), in points.
     band: Option<f32>,
     cursor: crate::cursor::os::OsCursor,
@@ -257,7 +262,7 @@ async fn try_backend(canvas: &web_sys::HtmlCanvasElement, backends: wgpu::Backen
         required_limits, experimental_features: Default::default(),
         memory_hints: Default::default(), trace: Default::default(),
     }).await.map_err(|e| format!("GPU device: {e}"))?;
-    Ok((Gpu { instance, adapter, device, queue }, surface))
+    Ok((Gpu::from_device(instance, adapter, device, queue), surface))
 }
 
 async fn gpu(canvas: web_sys::HtmlCanvasElement, features: wgpu::Features) -> Result<(Gpu, wgpu::Surface<'static>), String> {
@@ -276,6 +281,16 @@ impl<S: 'static> Browser<S> {
     fn end(&self, event_loop: &ActiveEventLoop) {
         self.shared.quitting.store(true, Ordering::Release);
         event_loop.exit();
+    }
+
+    /// Ends the app if the browser lost its GPU device: nothing more can draw on it, and every
+    /// frame tried on it would only add errors.
+    fn ended_by_lost_device(&self, event_loop: &ActiveEventLoop) -> bool {
+        let Some(why) = self.lost.borrow_mut().take() else { return false };
+        let canvas = self.window.as_ref().and_then(|w| w.canvas());
+        error(&format!("The GPU device was lost ({why}). Reload the page to draw again."), canvas.as_ref(), self.embedded, self.document);
+        self.end(event_loop);
+        true
     }
 }
 
@@ -378,6 +393,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
         if self.shared.quitting.load(Ordering::Acquire) { self.end(event_loop); return; }
+        if self.ended_by_lost_device(event_loop) { return; }
         let Some(window) = self.window.as_ref() else { return };
         if matches!(event, Wake::Ready) {
             let Some((result, fonts)) = self.pending.borrow_mut().take() else { return };
@@ -396,6 +412,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
             let (font_smoothing, fit_height) = (app.font_smoothing, app.fit_content_height);
             let tab_visits_controls = app.tab_visits_controls;
             let playground = app.playground.take();
+            let on_ready = app.on_ready.take();
             let (spec, state, shared) = app.into_parts(None);
             let scale = window.scale_factor() as f32;
             let document = self.document;
@@ -468,6 +485,11 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
                 config.format
             };
             surface.configure(&gpu.device, &config);
+            let (lost, proxy) = (self.lost.clone(), self.proxy.clone());
+            health::watch(&gpu.device, move |why| {
+                *lost.borrow_mut() = Some(why);
+                let _ = proxy.send_event(Wake::App);
+            });
             let mut renderer = Renderer::new(&gpu.device, format);
             renderer.set_srgb_blend(!format.is_srgb());
             renderer.attach_text(&mut rt.text.atlas);
@@ -476,14 +498,14 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
                 input::Mode { embedded: self.embedded, fit_height, document });
             *self.running.borrow_mut() = Some(Running { gpu, surface, config, renderer, rt, shared, input, clipboard,
                 clock: crate::frame::clock::FrameClock::new(now), compositor, suspended: false, embedded: self.embedded,
-                document, presented: false, band: None,
+                document, presented: false, band: None, on_ready,
                 cursor, _menus: menus, shortcuts });
         }
         if let Some(r) = &mut *self.running.borrow_mut() {
             r.shortcuts.drain();
             r.clipboard.receive(&mut r.rt);
             let requests = r.shared.take();
-            if requests.quit { self.end(event_loop); return; }
+            if requests.quit.is_some() { self.end(event_loop); return; }
             if requests.window.as_ref().is_some_and(|r| !matches!(r, crate::app::WindowRequest::Open(_) | crate::app::WindowRequest::Show))
                 || requests.position.is_some() || requests.place.is_some() || requests.minimize {
                 web_sys::console::warn_1(&"Native window management is ignored on web.".into());
@@ -496,7 +518,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        if matches!(event, WindowEvent::Focused(_)) { return; }
+        if matches!(event, WindowEvent::Focused(_)) || self.ended_by_lost_device(event_loop) { return; }
         let mut running = self.running.borrow_mut();
         let (Some(window), Some(r)) = (&self.window, &mut *running) else { return };
         let _input = crate::input::time::arrived(&event);
@@ -559,6 +581,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
                 if !r.presented {
                     r.presented = true;
                     r.input.presented();
+                    if let Some(mut ready) = r.on_ready.take() { ready(&crate::WindowHandle::new("main")); }
                     #[cfg(feature = "embedded-fonts")]
                     {
                         let proxy = self.proxy.clone();
@@ -566,7 +589,10 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
                     }
                 }
                 if r.rt.shell_request.take().is_some() { self.end(event_loop); return; }
-                if animating || r.rt.has_pending_input() || r.rt.live_pending() || r.compositor.as_ref().is_some_and(|c| c.animating()) {
+                // A frame that drew a fallback while the browser checks a pipeline is drawn
+                // again once it answers.
+                if animating || r.rt.has_pending_input() || r.rt.live_pending() || r.compositor.as_ref().is_some_and(|c| c.animating())
+                    || r.renderer.checking_gpu() {
                     window.request_redraw();
                 }
             }
@@ -576,6 +602,8 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         crate::cursor::os::make_pending(event_loop);
+        // Channels the app serves with 	ask::serve get their turn after the handlers that fed them.
+        crate::task::pump();
         let Ok(running) = self.running.try_borrow() else { return };
         let Some(r) = &*running else { return };
         event_loop.set_control_flow(match r.rt.wake_deadline() {

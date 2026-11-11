@@ -56,8 +56,8 @@ impl<S: 'static> Runtime<S> {
         // line count through a height spring, displaced siblings, or a lingering scroll glide.
         let revealed: HashSet<_> = self.nodes.iter()
             .filter(|n| {
-                n.input.as_ref().is_some_and(|input| input.edit.is_secure() && input.edit.is_revealed())
-                    || (n.input.is_none() && n.text.as_ref().is_some_and(|t| t.redacted && t.secure_revealed))
+                n.input.as_ref().is_some_and(|input| input.edit.masking() == crate::edit::Masking::Shown)
+                    || (n.input.is_none() && n.text.as_ref().is_some_and(|t| t.redacted && t.cold.secure_revealed))
             })
             .map(|n| n.id).collect();
         let mut concealed = std::mem::take(&mut scratch.concealed);
@@ -66,7 +66,7 @@ impl<S: 'static> Runtime<S> {
             concealed.resize(nodes.len(), false);
             for (i, n) in nodes.iter().enumerate() {
                 let hidden_now = n.input.as_ref().is_some_and(|input| input.edit.is_hidden_multiline())
-                    || (n.input.is_none() && n.text.as_ref().is_some_and(|t| t.redacted && !t.secure_revealed));
+                    || (n.input.is_none() && n.text.as_ref().is_some_and(|t| t.redacted && !t.cold.secure_revealed));
                 if hidden_now && revealed.contains(&n.id) {
                     concealed[i] = true;
                 }
@@ -107,7 +107,7 @@ impl<S: 'static> Runtime<S> {
             // So does a reveal in this commit for rows new to the stack: rows inserted above an
             // anchored first row and revealed at once land whole instead of growing from zero.
             let revealing = self.virtuals.get(&nodes[c].path)
-                .is_some_and(|v| self.scroll_reveals.iter().any(|r| r.viewport == v.scroll_path));
+                .is_some_and(|v| self.requests.reveals().any(|r| r.viewport == v.scroll_path));
             let revealed_now = self.virtuals.get(&nodes[c].path).is_some_and(|v| {
                 tx.scroll_to.iter().any(|r| {
                     nodes.iter().enumerate().find(|(_, n)| n.named(&r.key)
@@ -120,7 +120,7 @@ impl<S: 'static> Runtime<S> {
                 })
             });
             let reader = self.virtuals.get(&nodes[c].path)
-                .filter(|v| !self.keeps.iter().any(|k| k.viewport == v.scroll_path))
+                .filter(|v| !self.requests.keeps().any(|k| k.viewport == v.scroll_path))
                 .and_then(|v| self.path_ids.get(&v.scroll_path))
                 .and_then(|id| self.scrolls.get(id)).is_some_and(|s| !s.pinned());
             let reading = reader && !revealed_now;
@@ -189,12 +189,10 @@ impl<S: 'static> Runtime<S> {
             let resized = existed && (stack.window != self.viewport || held.get(c).copied().unwrap_or(false));
             stack.window = self.viewport;
             if first || !existed || tx.settle || self.reduced_motion || (reading && !revealing_moving) {
-                stack.width_hold_until = 0.0;
-                stack.width_shrink_until = 0.0;
+                stack.width_hold = WidthHold::Off;
                 stack.pending_heights.clear();
             } else if (width - stack.width).abs() > 0.25 {
-                stack.width_hold_until = now + 0.12;
-                stack.width_shrink_until = now + 0.4;
+                stack.width_hold = WidthHold::rewrap(now);
             }
             stack.width = width;
             stack.pending_heights.retain(|id, _| new_set.contains(id));
@@ -241,8 +239,8 @@ impl<S: 'static> Runtime<S> {
                 } else {
                     // Only a width/scale rewrap may shrink an active streaming row, including
                     // when fresh text arrives in the same frame as the resize.
-                    let t = if streaming && !self.relayout && now >= stack.width_shrink_until { h.max(g.h.min(g.target)) } else { h };
-                    if now < stack.width_hold_until {
+                    let t = if streaming && !self.relayout && stack.width_hold.may_shrink(now) { h.max(g.h.min(g.target)) } else { h };
+                    if stack.width_hold.defers(now) {
                         stack.pending_heights.insert(id, t);
                     } else {
                         stack.pending_heights.remove(&id);
@@ -270,10 +268,8 @@ impl<S: 'static> Runtime<S> {
                 && !self.scene.contains(nodes[last].id)
                 && let Some(s) = std::iter::successors(nodes[c].parent, |&p| nodes[p].parent)
                     .find(|&p| nodes[p].scroll.is_some() && nodes[p].scroll_axes.y())
-                && let Some(r) = self.scroll_reveals.iter_mut().find(|r| r.viewport == nodes[s].path && r.at_end)
             {
-                r.scope = None;
-                r.key = nodes[last].path.clone();
+                self.requests.step(requests::Event::NewTail { viewport: &nodes[s].path, key: &nodes[last].path });
             }
             stack.growing = !stack.pending_heights.is_empty()
                 || order.iter().any(|r| self.grows.get(r).is_some_and(|g| g.target > g.h + 1.0 / 128.0));
@@ -313,7 +309,7 @@ impl<S: 'static> Runtime<S> {
         let mut top_moved = std::mem::take(&mut scratch.top_moved);
         top_moved.clear();
         let has_virtuals = !self.virtuals.is_empty();
-        let mut last = paint_tracks::LastBuild::default();
+        let mut last = paint_tracks::Finder::default();
         let mut skip_cursor = 0usize;
         let mut i = 0usize;
         while i < nodes.len() {
@@ -769,7 +765,7 @@ impl<S: 'static> Runtime<S> {
                 // Exit visuals outlive their model. Never call an accessor captured by
                 // a deleted row while normalizing a later focus change.
                 if let Some(input) = &mut old.input {
-                    let was_revealed = input.edit.is_secure() && input.edit.is_revealed();
+                    let was_revealed = input.edit.masking() == crate::edit::Masking::Shown;
                     input.access = None;
                     input.key = None;
                     input.change = None;
@@ -787,7 +783,7 @@ impl<S: 'static> Runtime<S> {
                     }
                 } else if let Some(spec) = &mut old.text
                     && spec.redacted
-                    && spec.secure_revealed
+                    && spec.cold.secure_revealed
                 {
                     spec.conceal();
                     let scale = self.env.scale;
